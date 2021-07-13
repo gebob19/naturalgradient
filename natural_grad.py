@@ -1,13 +1,11 @@
 #%%
 import jax 
-import scipy
 
 import numpy as onp
 import jax.numpy as np 
 
-from jax.flatten_util import ravel_pytree
 from functools import partial
-from jax import random, vmap, jit, grad
+from jax import random, vmap, jit
 from jax.experimental import stax, optimizers
 from jax.experimental.stax import Dense, Relu
 
