@@ -1,11 +1,9 @@
 #%%
 import jax 
-
-import numpy as onp
 import jax.numpy as np 
+import numpy as onp
 
 from functools import partial
-from jax import random, vmap, jit
 from jax.experimental import stax, optimizers
 from jax.experimental.stax import Dense, Relu
 
@@ -14,7 +12,7 @@ from tqdm import tqdm
 
 from jax.config import config
 config.update("jax_debug_nans", True) # break on nans
-# config.update('jax_enable_x64', True) # use float64 for extra precision?
+config.update('jax_enable_x64', True) # use float64 for extra precision? -- cg round off error 
 
 #%%
 def make_float64(params):
@@ -22,17 +20,17 @@ def make_float64(params):
 
 net_init, net_apply = stax.serial(
     Dense(128), Relu,
-    Dense(10), 
+    Dense(10),
 )
 in_shape = (-1, 784)
-rng = random.PRNGKey(0)
+rng = jax.random.PRNGKey(0)
 out_shape, params = net_init(rng, in_shape)
-# params = make_float64(params)
+params = make_float64(params)
 
 #%%
 import datasets 
 train_images, train_labels, test_images, test_labels = datasets.mnist()
-# train_images, test_images = train_images.astype(np.float64), test_images.astype(np.float64)
+train_images, test_images = train_images.astype(np.float64), test_images.astype(np.float64)
 train_images.shape, test_labels.shape
 
 #%%
@@ -48,11 +46,11 @@ def cross_entropy(params, batch):
     return loss
 
 def mean_log_likelihood(params, batch):
-    lls = vmap(partial(log_likelihood, params), 0, 0)(batch)
+    lls = jax.vmap(partial(log_likelihood, params))(batch)
     return lls.mean()
 
 def mean_cross_entropy(params, batch):
-    losses = vmap(partial(cross_entropy, params), 0, 0)(batch)
+    losses = jax.vmap(partial(cross_entropy, params))(batch)
     loss = losses.mean()
     return loss 
 
@@ -62,72 +60,110 @@ def accuracy(params, batch):
     correct = y[probs.argmax()]
     return correct
 
-@jit
+@jax.jit
 def step(i, opt_state, batch):
     params = get_params(opt_state)
     loss, grads = jax.value_and_grad(mean_cross_entropy)(params, batch)
     return loss, opt_update(i, grads, opt_state), grads
 
-def grad2fisher(g):
-    if len(g.shape) == 1: # bias edge case 
-        g = g[:, np.newaxis]
-    return g @ g.T
+# #%%
+# ### sample code to test things out 
+# batch_size = 2
+# N = len(train_images)
+# train_idxs = onp.arange(N) # training idxs 
+# onp.random.shuffle(train_idxs) # shuffle training idxs
+# batch_idxs = onp.array_split(train_idxs, N//batch_size) # batch em
 
-@jit
-def natural_step_emp(i, opt_state, batch):
+# for _, idxs in enumerate(batch_idxs): # training loop 
+#     x = train_images[idxs]
+#     y = train_labels[idxs]
+#     break 
+
+# opt_init, opt_update, get_params = optimizers.adam(step_size=1e-2)
+# _, params = net_init(rng, in_shape) # init model
+# params = make_float64(params)
+# opt_state = opt_init(params) # init optim 
+# batch = (x, y)
+# x.shape, y.shape 
+
+#%%
+def hvp(J, w, v):
+    return jax.jvp(jax.grad(J), (w,), (v,))[1]
+
+# z = logits, J = fcn: logits->loss
+def gnh_vp(f, J, w, v):
+    # J v 
+    z, R_z = jax.jvp(f, (w,), (v,))
+    # H (J v)
+    R_gz = hvp(J, z, R_z)
+    # (H (J v))^T J = v^T (J^T H J) 
+    _, f_vjp = jax.vjp(f, w)
+    return f_vjp(R_gz)[0]
+
+def fisher_vp(f, w, v):
+    # J v 
+    _, R_z = jax.jvp(f, (w,), (v,))
+    # (J v)^T J = v^T (J^T J) 
+    _, f_vjp = jax.vjp(f, w)
+    return f_vjp(R_z)[0]
+
+@jax.jit
+def natural_emp_step(i, opt_state, batch):
     params = get_params(opt_state)
-    # gradient for loss
+
     loss, grads = jax.value_and_grad(mean_cross_entropy)(params, batch)
-    fisher = jax.tree_map(grad2fisher, grads)
+    f = lambda w: mean_cross_entropy(w, batch)
+    fvp = lambda v: fisher_vp(f, params, v)
+    ngrad, _ = jax.scipy.sparse.linalg.cg(fvp, grads, maxiter=10) # approx solve
 
-    # approx solve for gradient 
-    cg_solve = lambda f, g: jax.scipy.sparse.linalg.cg(f, g, maxiter=100)[0]
-    natural_grad_emp = jax.tree_multimap(cg_solve, fisher, grads)
+    return loss, opt_update(i, ngrad, opt_state), ngrad
 
-    return loss, opt_update(i, natural_grad_emp, opt_state), natural_grad_emp
+def sample_label(logits, rng):
+    idx = jax.random.categorical(rng, logits, -1)
+    one_hot = jax.nn.one_hot(idx, 10)
+    return one_hot
 
-def natural_fisher(params, batch):
-    # compute fisher 
-    ll_grads = jax.grad(mean_log_likelihood)(params, batch) 
-    fisher = jax.tree_map(grad2fisher, ll_grads) 
-    return fisher 
+def sample_label_rng(x, rng):
+    rng, subkey = jax.random.split(rng, 2)
+    return rng, sample_label(x, subkey)
 
-def natural_step(n_samples): ## lil trick to take n_samples as input (otherwise can't @jit it)
+def tree_mvp_dampen(mvp, lmbda=0.1):
+    dampen_fcn = lambda mvp_, v_: mvp_ + lmbda * v_
+    damp_mvp = lambda v: jax.tree_multimap(dampen_fcn, mvp(v), v)
+    return damp_mvp
 
-    @jit
-    def natural_step_inner(i, opt_state, batch, rng):
-        params = get_params(opt_state)
-        # gradient for loss
-        loss, grads = jax.value_and_grad(mean_cross_entropy)(params, batch)
-        
-        # sample from model predictions
-        x, _ = batch 
-        logits = net_apply(params, x)
-        rng, *subkeys = random.split(rng, 1 + n_samples) # jax random things 
-        sample_idxs = jax.tree_map(lambda k: jax.random.categorical(k, logits, -1), subkeys)
-        y_oh = vmap(lambda i: jax.nn.one_hot(i, 10), 0, 0)(sample_idxs)
-        y_oh = y_oh.transpose(1, 0, 2) # (nsamples, batch, n_classes)
-        y_oh = jax.lax.stop_gradient(y_oh) 
-        
-        # compute fisher 
-        fishers = vmap(lambda y: natural_fisher(params, (x, y)))(y_oh)
-        fisher = jax.tree_map(lambda f: f.mean(0), fishers)
-
-        # approx solve for gradient 
-        cg_solve = lambda f, g: jax.scipy.sparse.linalg.cg(f, g, maxiter=100)[0]
-        natural_grad = jax.tree_multimap(cg_solve, fisher, grads)
-
-        # gradient clipping (exploding gradients problem :?)
-        natural_grad = jax.tree_map(lambda f: np.clip(f, a_min=-10, a_max=10), natural_grad)
-
-        return loss, opt_update(i, natural_grad, opt_state), natural_grad, rng
+@jax.jit
+def natural_step(i, opt_state, batch, rng):
+    params = get_params(opt_state)
     
-    return natural_step_inner
+    # sample model labels 
+    x, _ = batch
+    logits = net_apply(params, x)
+    
+    new_labels = jax.lax.scan(lambda rng, x: sample_label_rng(x, rng), rng, logits)[1]
+    new_labels = jax.lax.stop_gradient(new_labels) # stop backprop on the targets
+    sampled_batch = (x, new_labels)
+
+    # gradients on true labels
+    loss, grads = jax.value_and_grad(mean_cross_entropy)(params, batch)
+
+    # fisher on sampled labels 
+    f = lambda w: mean_cross_entropy(w, sampled_batch)
+    fvp = lambda v: fisher_vp(f, params, v)
+    fvp = tree_mvp_dampen(fvp, lmbda=1e-8) # dampen (F_w + I * lmbda)^-1 \nabla L
+    ngrad, _ = jax.scipy.sparse.linalg.cg(fvp, grads, maxiter=10) # approx solve
+
+    return loss, opt_update(i, ngrad, opt_state), ngrad
+
+# %%
+%timeit step(0, opt_state, (x, y)) # 1.61 ms ± 143 µs per loop (mean ± std. dev. of 7 runs, 1000 loops each)
+%timeit natural_emp_step(0, opt_state, (x, y)) # 3.15 ms ± 572 µs per loop (mean ± std. dev. of 7 runs, 1 loop each)
+%timeit natural_step(0, opt_state, (x, y), rng) # 3.95 ms ± 227 µs per loop (mean ± std. dev. of 7 runs, 1 loop each)
 
 #%%
 from torch.utils.tensorboard import SummaryWriter
 
-def train(step_fcn, exp_name, seed=0, rng_in_out=False):
+def train(step_fcn, exp_name, seed=0, rng_in=False):
     global opt_init, opt_update, get_params
 
     # re-producibility 
@@ -140,9 +176,9 @@ def train(step_fcn, exp_name, seed=0, rng_in_out=False):
 
     opt_init, opt_update, get_params = optimizers.adam(step_size=lr)
 
-    rng = random.PRNGKey(seed)
+    rng = jax.random.PRNGKey(seed)
     _, params = net_init(rng, in_shape) # init model
-    # params = make_float64(params)
+    params = make_float64(params)
     opt_state = opt_init(params) # init optim 
 
     step_i = 0 
@@ -151,13 +187,14 @@ def train(step_fcn, exp_name, seed=0, rng_in_out=False):
         onp.random.shuffle(train_idxs) # shuffle training idxs
         batch_idxs = onp.array_split(train_idxs, N//batch_size) # batch em
 
-        for idxs in tqdm(batch_idxs): # training loop 
+        for _, idxs in enumerate(tqdm(batch_idxs)): # training loop 
             x = train_images[idxs]
             y = train_labels[idxs]
             
             # optim 
-            if rng_in_out: 
-                loss, opt_state, grads, rng = step_fcn(step_i, opt_state, (x, y), rng)
+            if rng_in: 
+                rng, subkey = jax.random.split(rng)                
+                loss, opt_state, grads = step_fcn(step_i, opt_state, (x, y), subkey)
             else:
                 loss, opt_state, grads = step_fcn(step_i, opt_state, (x, y))
             
@@ -166,10 +203,13 @@ def train(step_fcn, exp_name, seed=0, rng_in_out=False):
             for i, (p, g) in enumerate(zip(params, grads)):
                 if p or g: # ignore activations (e.g `()`)
                     (pw, pb), (gw, gb) = p, g
-                    writer.add_histogram(f'w{i}/value', onp.asarray(pw), step_i)
-                    writer.add_histogram(f'w{i}/grad', onp.asarray(gw), step_i)
-                    writer.add_histogram(f'b{i}/value', onp.asarray(pb), step_i)
-                    writer.add_histogram(f'b{i}/grad', onp.asarray(gb), step_i)
+                    try: 
+                        writer.add_histogram(f'w{i}/value', onp.asarray(pw), step_i)
+                        writer.add_histogram(f'w{i}/grad', onp.asarray(gw), step_i)
+                        writer.add_histogram(f'b{i}/value', onp.asarray(pb), step_i)
+                        writer.add_histogram(f'b{i}/grad', onp.asarray(gb), step_i)
+                    except: # errors out when values are too large
+                        pass 
 
             writer.add_scalar('train/loss', loss.item(), step_i)
 
@@ -177,10 +217,10 @@ def train(step_fcn, exp_name, seed=0, rng_in_out=False):
             step_i += 1 
 
         params = get_params(opt_state)    
-        test_acc = jit(vmap(accuracy, (None, 0), 0))(params, (test_images, test_labels)).mean()
+        test_acc = jax.jit(jax.vmap(accuracy, (None, 0), 0))(params, (test_images, test_labels)).mean()
+        print(f'epoch: {e} test_acc: {test_acc * 100:.2f} train_loss: {train_loss:.2f}')
         writer.add_scalar('test/accuracy', test_acc.item(), e)
 
-        print(f'epoch: {e} test_acc: {test_acc * 100:.2f} train_loss: {train_loss:.2f}')
         train_loss = 0 
 
     params = get_params(opt_state)    
@@ -191,16 +231,13 @@ epochs = 2
 batch_size = 128
 lr = 1e-3
 
-#%%
-params = train(step, 'vanilla SGD')
+# #%%
+# params = train(step, 'vanilla_SGD_f64')
 
-#%%
-params = train(natural_step_emp, 'natural(emp)')
-
-# %%
-params = train(natural_step(n_samples=1) , 'natural(1sample)', rng_in_out=True)
+# #%%
+# params = train(natural_emp_step, 'natural(emp)_f64')
 
 # %%
-params = train(natural_step(n_samples=5), 'natural(5sample)', rng_in_out=True)
+params = train(natural_step , 'natural_f64', rng_in=True)
 
 # %%
