@@ -107,6 +107,40 @@ def fisher_vp(f, w, v):
     _, f_vjp = jax.vjp(f, w)
     return f_vjp(R_z)[0]
 
+def D_KL(z1, z2):
+    p1, p2 = jax.nn.softmax(z1), jax.nn.softmax(z2)
+    d_kl = (p2 * (np.log(p2) - np.log(p1))).sum(-1) # sum over probs 
+    return d_kl.mean() # mean over batch 
+
+def D_KL_probs(p1, p2):
+    d_kl = (p1 * (np.log(p1) - np.log(p2))).sum(-1) # sum over probs
+    return d_kl.mean() # mean over batch 
+
+def pullback_mvp(f, rho, w, v):
+    z, R_z = jax.jvp(f, (w,), (v,))
+    R_gz = hvp(lambda z1: rho(z, z1), z, R_z)
+    _, f_vjp = jax.vjp(f, w)
+    return f_vjp(R_gz)[0]
+
+#%%
+def vector_to_parameters_list(vec, parameters):
+    # Pointer for slicing the vector for each parameter
+    pointer = 0
+    vec_params = []
+    for param in parameters:
+        # The length of the parameter
+        num_param = param.size
+        # Slice the vector, reshape it, and replace the old data of the parameter
+        vec_params.append(vec[pointer:pointer + num_param].reshape(param.shape))
+        # Increment the pointer
+        pointer += num_param
+    return vec_params
+
+#%%
+#%%
+#%%
+#%%
+
 @jax.jit
 def natural_emp_step(i, opt_state, batch):
     params = get_params(opt_state)
@@ -132,6 +166,20 @@ def tree_mvp_dampen(mvp, lmbda=0.1):
     damp_mvp = lambda v: jax.tree_multimap(dampen_fcn, mvp(v), v)
     return damp_mvp
 
+# hessian from finite differences 
+def finite_Hv(get_loss_grads, fparams, r, v):
+    # positive direction 
+    wp = fparams + r * v 
+    pos_fgrads = get_loss_grads(wp)
+    
+    # negative direction
+    wn = fparams - r * v 
+    neg_fgrads = get_loss_grads(wn)
+
+    # gradient 
+    Hv = (pos_fgrads - neg_fgrads) / (2 * r)
+    return Hv 
+
 @jax.jit
 def natural_step(i, opt_state, batch, rng):
     params = get_params(opt_state)
@@ -147,18 +195,38 @@ def natural_step(i, opt_state, batch, rng):
     # gradients on true labels
     loss, grads = jax.value_and_grad(mean_cross_entropy)(params, batch)
 
-    # fisher on sampled labels 
+    ## v1 (JJT) = epoch: 1 test_acc: 95.82 train_loss: 79.20 -- 37.98s/it
+    ## fisher on sampled labels 
     f = lambda w: mean_cross_entropy(w, sampled_batch)
     fvp = lambda v: fisher_vp(f, params, v)
-    fvp = tree_mvp_dampen(fvp, lmbda=1e-8) # dampen (F_w + I * lmbda)^-1 \nabla L
+
+    # # ## v3 (finite differences) = ?? doesnt work ?? 
+    # # epoch: 1 test_acc: 36.85 train_loss: 1273.68 --  66.18s/it
+    # vec = lambda t: np.concatenate([p.flatten() for p in t])
+    
+    # from jax.tree_util import tree_flatten, tree_unflatten
+    # paramsf, unflatten_value = tree_flatten(params)
+    # paramsf = vec(paramsf)
+    # vec2leaves = lambda v: vector_to_parameters_list(v, jax.tree_util.tree_leaves(params))
+    # unflatten = lambda t: tree_unflatten(unflatten_value, vec2leaves(t))
+    # flatten = lambda t: vec(tree_flatten(t)[0])
+
+    # f = lambda wf: flatten(jax.grad(mean_cross_entropy)(unflatten(wf), batch))
+    # fvp = lambda v: unflatten(finite_Hv(f, paramsf, 1e-8, -flatten(v)))
+    
+    # ## v2 (JHJT) -- epoch: 1 test_acc: 95.46 train_loss: 76.73 -- 53.78s/it
+    # f = lambda w: net_apply(w, x)
+    # fvp = lambda v: pullback_mvp(f, D_KL, params, v)
+
+    fvp = tree_mvp_dampen(fvp, lmbda=1e-3) # dampen (F_w + I * lmbda)^-1 \nabla L
     ngrad, _ = jax.scipy.sparse.linalg.cg(fvp, grads, maxiter=10) # approx solve
 
     return loss, opt_update(i, ngrad, opt_state), ngrad
 
-# %%
-%timeit step(0, opt_state, (x, y)) # 1.61 ms ± 143 µs per loop (mean ± std. dev. of 7 runs, 1000 loops each)
-%timeit natural_emp_step(0, opt_state, (x, y)) # 3.15 ms ± 572 µs per loop (mean ± std. dev. of 7 runs, 1 loop each)
-%timeit natural_step(0, opt_state, (x, y), rng) # 3.95 ms ± 227 µs per loop (mean ± std. dev. of 7 runs, 1 loop each)
+# # %%
+# %timeit step(0, opt_state, (x, y)) # 1.61 ms ± 143 µs per loop (mean ± std. dev. of 7 runs, 1000 loops each)
+# %timeit natural_emp_step(0, opt_state, (x, y)) # 3.15 ms ± 572 µs per loop (mean ± std. dev. of 7 runs, 1 loop each)
+# %timeit natural_step(0, opt_state, (x, y), rng) # 3.95 ms ± 227 µs per loop (mean ± std. dev. of 7 runs, 1 loop each)
 
 #%%
 from torch.utils.tensorboard import SummaryWriter
